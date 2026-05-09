@@ -1,0 +1,26 @@
+[package]
+name = "ferrumpress-auth"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ferrumpress-core = { path = "../ferrumpress-core" }
+async-trait = "0.1"
+jsonwebtoken = "10.3.0"
+argon2 = { version = "0.5", optional = true }
+rand = "0.10.1"
+uuid = { version = "1", features = ["v4"] }
+serde = "1"
+ed25519-dalek = { version = "2", features = ["serde"] }
+base64 = "0.22.1"
+pqcrypto-kyber = "0.8.1"
+pqcrypto-dilithium = { version = "0.5.0", optional = true }
+pem = "3"
+chrono = "0.4.44"
+pqcrypto-traits = "0.3.5"
+aes-gcm = "0.10"
+
+[features]
+default = ["password"]
+password = ["argon2"]
+pqc = ["pqcrypto-dilithium"]

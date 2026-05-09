@@ -1,0 +1,15 @@
+# Cargo.toml в корне
+[workspace]
+resolver = "2"
+members = [
+    "ferrumpress-core",
+    "ferrumpress-db",
+    "ferrumpress-session",
+    "ferrumpress-auth",
+    "ferrumpress-storage",
+    "ferrumpress-search",
+    "ferrumpress-queue",
+    "ferrumpress-app",
+    "ferrumpress-cli",
+    "ferrumpress-cache",
+]

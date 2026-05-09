@@ -1,0 +1,31 @@
+[package]
+name = "ferrumpress-db"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ferrumpress-core = { path = "../ferrumpress-core" }
+sqlx = { version = "0.8.6", default-features = false, features = [
+    "runtime-tokio-rustls", "uuid", "chrono", "any"
+] }
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+sqlparser = "0.62"
+serde = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["sync"] }
+
+barrel = { version = "0.7", optional = true, default-features = false }
+chrono = { version = "0.4", features = ["serde"], optional = true }
+lazy_static = { version = "1.4", optional = true }
+
+sea-schema = { version = "0.16", features = ["discovery"], optional = true }
+sea-query = { version = "0.32", optional = true }
+
+[features]
+default = ["sqlite"]
+sqlite = ["sqlx/sqlite", "barrel/sqlite3"]
+postgres = ["sqlx/postgres", "barrel/pg"]
+mysql = ["sqlx/mysql", "barrel/mysql"]
+migrations = ["barrel", "chrono", "lazy_static"]
+discover = ["sea-schema", "sea-query", "sea-schema/postgres", "sea-schema/mysql", "sea-schema/sqlite"]
