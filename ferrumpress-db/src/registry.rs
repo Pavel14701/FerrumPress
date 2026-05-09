@@ -43,7 +43,23 @@ impl ServiceRegistry {
     }
 }
 
+pub struct CustomServiceRegistry {
+    services: Mutex<HashMap<String, Arc<dyn Any + Send + Sync>>>,
+}
+
+impl CustomServiceRegistry {
+    pub fn new() -> Self { Self { services: Mutex::new(HashMap::new()) } }
+    pub fn register<T: Any + Send + Sync>(&self, name: &str, service: Arc<T>) {
+        self.services.lock().unwrap().insert(name.into(), service);
+    }
+    pub fn get<T: Any + Send + Sync>(&self, name: &str) -> Option<Arc<T>> {
+        self.services.lock().unwrap().get(name)?.clone().downcast::<T>().ok()
+    }
+}
+
 lazy_static! {
     pub static ref MODEL_REGISTRY: ModelRegistry = ModelRegistry::new();
     pub static ref SERVICE_REGISTRY: ServiceRegistry = ServiceRegistry::new();
+    pub static ref CUSTOM_SERVICES: CustomServiceRegistry = CustomServiceRegistry::new();
+
 }

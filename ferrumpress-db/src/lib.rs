@@ -30,3 +30,5 @@ pub mod type_mapping;
 pub mod generic_service;
 #[cfg(feature = "discover")]
 pub mod schema_discovery;
+#[cfg(feature = "migrations")]
+pub mod migrations;
