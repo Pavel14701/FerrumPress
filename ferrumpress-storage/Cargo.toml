@@ -1,6 +1,30 @@
 [package]
 name = "ferrumpress-storage"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+ferrumpress-core = { path = "../ferrumpress-core" }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "any", "uuid", "chrono"] }
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+serde = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2.0.18"
+
+# S3-совместимое хранилище (замена aws-sdk-s3)
+rust-s3 = { version = "0.37.2", optional = true, default-features = false, features = ["with-tokio"] }
+
+# Конвертация изображений (опционально)
+image = { version = "0.25", optional = true }
+webp = { version = "0.3", optional = true }
+ravif = { version = "0.13", optional = true }
+num_cpus = { version = "1", optional = true }
+
+[features]
+default = ["local"]
+local = []
+s3 = ["rust-s3"]
+image-processing = ["image", "webp", "ravif", "num_cpus"]

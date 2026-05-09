@@ -47,18 +47,6 @@ pub enum QueueError {
 }
 
 #[derive(Error, Debug)]
-pub enum StorageError {
-    #[error("object not found: {0}")]
-    NotFound(String),
-    #[error("upload failed: {0}")]
-    UploadFailed(String),
-    #[error("download failed: {0}")]
-    DownloadFailed(String),
-    #[error("configuration error: {0}")]
-    Config(String),
-}
-
-#[derive(Error, Debug)]
 pub enum SearchError {
     #[error("indexing failed: {0}")]
     IndexingFailed(String),
@@ -118,4 +106,28 @@ pub enum SchemaError {
     TableExists(String),
     #[error("database error: {0}")]
     Database(String),
+}
+
+#[derive(Error, Debug)]
+pub enum StorageError {
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("upload failed: {0}")]
+    UploadFailed(String),
+    #[error("download failed: {0}")]
+    DownloadFailed(String),
+    #[error("unknown strategy: {0}")]
+    UnknownStrategy(String),
+}
+
+#[derive(Error, Debug)]
+pub enum MediaError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error("database error: {0}")]
+    Database(String),
+    #[error("image processing error: {0}")]
+    Image(String),
+    #[error("unknown strategy: {0}")]
+    UnknownStrategy(String),
 }
