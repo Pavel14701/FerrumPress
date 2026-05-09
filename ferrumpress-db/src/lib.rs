@@ -28,5 +28,7 @@ pub mod schema_builder;
 pub mod type_mapping;
 #[cfg(feature = "migrations")]
 pub mod generic_service;
+#[cfg(feature = "migrations")]
+pub mod migrations;
 #[cfg(feature = "discover")]
 pub mod schema_discovery;
