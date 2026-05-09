@@ -8,9 +8,8 @@ use ferrumpress_core::traits::{
     StorageBackend, MediaService,
     ImageVariant, ProcessMediaTask,
     CacheProvider, TaskQueue, CacheOptions,
-    ImageProcessor        // задачи – из traits
+    ImageProcessor
 };
-
 use ferrumpress_core::models::{Media, Task};
 use ferrumpress_core::error::{MediaError, StorageError};
 
@@ -49,21 +48,9 @@ impl MediaServiceImpl {
         }
     }
 
-    /// Преобразование строки БД в Media с ручным парсингом UUID и DateTime,
-    /// потому что AnyPool не гарантирует поддержку этих типов напрямую.
     fn row_to_media(row: &sqlx::any::AnyRow) -> Result<Media, MediaError> {
         let id_str: String = row.try_get("id").map_err(|e| MediaError::Database(e.to_string()))?;
         let id = Uuid::parse_str(&id_str).map_err(|e| MediaError::Database(e.to_string()))?;
-
-        let original_name: String = row.try_get("original_name").map_err(|e| MediaError::Database(e.to_string()))?;
-        let storage_strategy: String = row.try_get("storage_strategy").map_err(|e| MediaError::Database(e.to_string()))?;
-        let storage_key: String = row.try_get("storage_key").map_err(|e| MediaError::Database(e.to_string()))?;
-        let mime_type: String = row.try_get("mime_type").map_err(|e| MediaError::Database(e.to_string()))?;
-        let size: i64 = row.try_get("size").map_err(|e| MediaError::Database(e.to_string()))?;
-        let width: Option<i32> = row.try_get("width").map_err(|e| MediaError::Database(e.to_string()))?;
-        let height: Option<i32> = row.try_get("height").map_err(|e| MediaError::Database(e.to_string()))?;
-        let status: String = row.try_get("status").map_err(|e| MediaError::Database(e.to_string()))?;
-        let variants: Option<String> = row.try_get("variants").map_err(|e| MediaError::Database(e.to_string()))?;
 
         let created_at_str: String = row.try_get("created_at").map_err(|e| MediaError::Database(e.to_string()))?;
         let created_at = DateTime::parse_from_rfc3339(&created_at_str)
@@ -74,6 +61,16 @@ impl MediaServiceImpl {
         let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
             .map_err(|e| MediaError::Database(e.to_string()))?
             .with_timezone(&Utc);
+
+        let original_name: String = row.try_get("original_name").map_err(|e| MediaError::Database(e.to_string()))?;
+        let storage_strategy: String = row.try_get("storage_strategy").map_err(|e| MediaError::Database(e.to_string()))?;
+        let storage_key: String = row.try_get("storage_key").map_err(|e| MediaError::Database(e.to_string()))?;
+        let mime_type: String = row.try_get("mime_type").map_err(|e| MediaError::Database(e.to_string()))?;
+        let size: i64 = row.try_get("size").map_err(|e| MediaError::Database(e.to_string()))?;
+        let width: Option<i32> = row.try_get("width").map_err(|e| MediaError::Database(e.to_string()))?;
+        let height: Option<i32> = row.try_get("height").map_err(|e| MediaError::Database(e.to_string()))?;
+        let status: String = row.try_get("status").map_err(|e| MediaError::Database(e.to_string()))?;
+        let variants: Option<String> = row.try_get("variants").map_err(|e| MediaError::Database(e.to_string()))?;
 
         Ok(Media {
             id,
@@ -88,9 +85,9 @@ impl MediaServiceImpl {
             variants,
             created_at,
             updated_at,
-        })
-    }
-}
+        }
+    )
+}}
 
 #[async_trait]
 impl MediaService for MediaServiceImpl {
@@ -106,8 +103,9 @@ impl MediaService for MediaServiceImpl {
             .ok_or_else(|| MediaError::UnknownStrategy(strategy.into()))?;
         let id = Uuid::new_v4();
         let storage_key = format!("{}/{}", id, original_name);
+        let size = data.len() as i64;                    // сохраняем размер до перемещения
 
-        backend.put(&storage_key, data.clone(), mime_type).await?;
+        backend.put(&storage_key, data, mime_type).await?;   // data больше не используется
 
         let now = Utc::now();
         let will_convert = convert && Self::is_image(mime_type) && self.image_processor.is_some();
@@ -117,17 +115,17 @@ impl MediaService for MediaServiceImpl {
             "INSERT INTO media (id, original_name, storage_strategy, storage_key, mime_type, size, width, height, status, variants, created_at, updated_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"
         )
-        .bind(id.to_string())                   // UUID -> String
+        .bind(id.to_string())
         .bind(original_name)
         .bind(strategy)
         .bind(&storage_key)
         .bind(mime_type)
-        .bind(data.len() as i64)
+        .bind(size)                                     // используем сохранённый размер
         .bind(None::<i32>)
         .bind(None::<i32>)
         .bind(status)
         .bind(None::<String>)
-        .bind(now.to_rfc3339())                // DateTime -> String
+        .bind(now.to_rfc3339())
         .bind(now.to_rfc3339())
         .execute(&self.pool)
         .await
@@ -151,7 +149,7 @@ impl MediaService for MediaServiceImpl {
             storage_strategy: strategy.into(),
             storage_key,
             mime_type: mime_type.into(),
-            size: data.len() as i64,
+            size,
             width: None,
             height: None,
             status: status.into(),
@@ -173,7 +171,7 @@ impl MediaService for MediaServiceImpl {
         }
 
         let row = sqlx::query::<sqlx::Any>("SELECT * FROM media WHERE id = $1")
-            .bind(id.to_string())   // UUID -> String
+            .bind(id.to_string())
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| MediaError::Database(e.to_string()))?;
@@ -204,7 +202,7 @@ impl MediaService for MediaServiceImpl {
         }
 
         sqlx::query::<sqlx::Any>("DELETE FROM media WHERE id = $1")
-            .bind(id.to_string())   // UUID -> String
+            .bind(id.to_string())
             .execute(&self.pool)
             .await
             .map_err(|e| MediaError::Database(e.to_string()))?;

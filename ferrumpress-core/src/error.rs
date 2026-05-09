@@ -1,4 +1,5 @@
 use thiserror::Error;
+use sqlx::Error as SqlxError;
 
 #[derive(Error, Debug)]
 pub enum DbError {
@@ -118,6 +119,12 @@ pub enum StorageError {
     DownloadFailed(String),
     #[error("unknown strategy: {0}")]
     UnknownStrategy(String),
+}
+
+impl From<SqlxError> for MediaError {
+    fn from(e: SqlxError) -> Self {
+        MediaError::Database(e.to_string())
+    }
 }
 
 #[derive(Error, Debug)]

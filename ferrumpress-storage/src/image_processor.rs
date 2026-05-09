@@ -1,15 +1,9 @@
 #[cfg(feature = "image-processing")]
 use async_trait::async_trait;
 #[cfg(feature = "image-processing")]
-use ferrumpress_core::traits::ImageVariant;
+use ferrumpress_core::traits::{ImageProcessor, ImageVariant};
 #[cfg(feature = "image-processing")]
 use std::io::Cursor;
-
-#[cfg(feature = "image-processing")]
-#[async_trait]
-pub trait ImageProcessor: Send + Sync {
-    async fn process_image(&self, data: Vec<u8>, source_mime: &str) -> Result<Vec<ImageVariant>, String>;
-}
 
 #[cfg(feature = "image-processing")]
 pub struct DefaultImageProcessor;
@@ -20,7 +14,7 @@ impl ImageProcessor for DefaultImageProcessor {
     async fn process_image(&self, data: Vec<u8>, source_mime: &str) -> Result<Vec<ImageVariant>, String> {
         let format = match source_mime {
             "image/jpeg" => image::ImageFormat::Jpeg,
-            "image/png" => image::ImageFormat::Png,
+            "image/png"  => image::ImageFormat::Png,
             "image/webp" => image::ImageFormat::WebP,
             "image/avif" => image::ImageFormat::Avif,
             _ => return Err("Unsupported source format".into()),
