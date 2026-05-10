@@ -3,6 +3,8 @@ use async_trait::async_trait;
 #[cfg(feature = "image-processing")]
 use ferrumpress_core::traits::{ImageProcessor, ImageVariant};
 #[cfg(feature = "image-processing")]
+use crate::ProcessedVariant;
+#[cfg(feature = "image-processing")]
 use std::io::Cursor;
 
 #[cfg(feature = "image-processing")]
@@ -11,7 +13,7 @@ pub struct DefaultImageProcessor;
 #[cfg(feature = "image-processing")]
 #[async_trait]
 impl ImageProcessor for DefaultImageProcessor {
-    async fn process_image(&self, data: Vec<u8>, source_mime: &str) -> Result<Vec<ImageVariant>, String> {
+    async fn process_image(&self, data: Vec<u8>, source_mime: &str) -> Result<Vec<ProcessedVariant>, String> {
         let format = match source_mime {
             "image/jpeg" => image::ImageFormat::Jpeg,
             "image/png"  => image::ImageFormat::Png,
@@ -34,12 +36,15 @@ impl ImageProcessor for DefaultImageProcessor {
             let encoder = webp::Encoder::from_rgba(&rgba, w, h);
             encoder.encode(80.0).to_vec()
         };
-        variants.push(ImageVariant {
-            format: "webp".into(),
-            key: String::new(),
-            size: webp_data.len() as u64,
-            width: w,
-            height: h,
+        variants.push(ProcessedVariant {
+            meta: ImageVariant {
+                format: "webp".into(),
+                key: String::new(),
+                size: webp_data.len() as u64,
+                width: w,
+                height: h,
+            },
+            data: webp_data,
         });
 
         // AVIF
@@ -52,12 +57,15 @@ impl ImageProcessor for DefaultImageProcessor {
                 .map_err(|e| e.to_string())?;
             encoded.avif_file
         };
-        variants.push(ImageVariant {
-            format: "avif".into(),
-            key: String::new(),
-            size: avif_data.len() as u64,
-            width: w,
-            height: h,
+        variants.push(ProcessedVariant {
+            meta: ImageVariant {
+                format: "avif".into(),
+                key: String::new(),
+                size: avif_data.len() as u64,
+                width: w,
+                height: h,
+            },
+            data: avif_data,
         });
 
         Ok(variants)

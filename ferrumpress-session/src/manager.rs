@@ -7,40 +7,36 @@ use ferrumpress_core::error::SessionError;
 
 pub struct SessionManager {
     store: Arc<dyn SessionStore>,
-    cache: Option<Arc<dyn CacheProvider>>,   // для произвольных данных
+    cache: Option<Arc<dyn CacheProvider>>,
     cleanup_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl SessionManager {
-    /// Создаёт менеджера сессий.
-    /// - `store` – хранилище refresh‑токенов.
-    /// - `cache` – опциональный кэш для хранения дополнительных данных сессии.
-    /// - `cleanup_interval` – интервал автоматической очистки истёкших токенов.
     pub fn new(
         store: Arc<dyn SessionStore>,
         cache: Option<Arc<dyn CacheProvider>>,
         cleanup_interval: Option<Duration>,
     ) -> Self {
-        let cleanup_handle = if let Some(interval) = cleanup_interval {
+        let cleanup_handle = cleanup_interval.map(|interval| {
             let store_clone = store.clone();
-            Some(tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(interval).await;
-                    if let Err(e) = store_clone.cleanup_expired().await {
-                        tracing::error!("Session cleanup failed: {}", e);
-                    }
-                }
-            }))
-        } else {
-            None
-        };
+            tokio::spawn(Self::run_cleanup_loop(store_clone, interval))
+        });
+
         Self { store, cache, cleanup_handle }
     }
 
-    // ------------------------------------------------------------
-    //  Работа с refresh‑токенами (основные методы SessionStore)
-    // ------------------------------------------------------------
+    async fn run_cleanup_loop(store: Arc<dyn SessionStore>, interval: Duration) {
+        loop {
+            tokio::time::sleep(interval).await;
+            if let Err(e) = store.cleanup_expired().await {
+                tracing::error!("Session cleanup failed: {}", e);
+            }
+        }
+    }
 
+    // ------------------------------------------------------------
+    //  Refresh-токены
+    // ------------------------------------------------------------
     pub async fn save_refresh_token(&self, info: &RefreshTokenInfo) -> Result<(), SessionError> {
         self.store.save_refresh_token(info).await
     }
@@ -50,7 +46,6 @@ impl SessionManager {
     }
 
     pub async fn revoke_refresh_token(&self, jti: &str) -> Result<(), SessionError> {
-        // При отзыве токена удаляем и связанные данные сессии
         if let Some(cache) = &self.cache {
             let _ = cache.delete(&session_data_key(jti)).await;
         }
@@ -58,9 +53,6 @@ impl SessionManager {
     }
 
     pub async fn revoke_all_for_user(&self, user_id: Uuid) -> Result<(), SessionError> {
-        // При принудительном выходе всех сессий пользователя удаляем все данные всех сессий (не зная jti)
-        // Можно реализовать сканирование ключей, но проще инвалидировать по тегу, если используется Redis.
-        // Пока оставим базовую реализацию через store, а данные будут теряться по TTL.
         self.store.revoke_all_for_user(user_id).await
     }
 
@@ -69,14 +61,8 @@ impl SessionManager {
     }
 
     // ------------------------------------------------------------
-    //  Произвольные данные сессии (связаны с jti)
+    //  Произвольные данные сессии
     // ------------------------------------------------------------
-
-    /// Сохранить произвольные данные сессии.
-    ///
-    /// - `jti` – идентификатор refresh‑токена (идентификатор сессии).
-    /// - `data` – данные для сохранения (любой сериализуемый объект).
-    /// - `ttl` – время жизни данных; если `None`, используется оставшееся время refresh‑токена.
     pub async fn set_data<T: serde::Serialize>(
         &self,
         jti: &str,
@@ -85,33 +71,15 @@ impl SessionManager {
     ) -> Result<(), SessionError> {
         let cache = self.cache.as_ref().ok_or(SessionError::Storage("cache not configured".into()))?;
         let json = serde_json::to_vec(data).map_err(|e| SessionError::Storage(e.to_string()))?;
-
-        let effective_ttl = match ttl {
-            Some(t) => t,
-            None => {
-                // Пытаемся получить refresh‑токен, чтобы узнать оставшееся время
-                if let Some(token_info) = self.store.get_refresh_token(jti).await? {
-                    let now = chrono::Utc::now();
-                    let remaining = token_info.expires_at - now;
-                    if remaining.num_seconds() > 0 {
-                        Duration::from_secs(remaining.num_seconds() as u64)
-                    } else {
-                        return Err(SessionError::Expired);
-                    }
-                } else {
-                    return Err(SessionError::NotFound);
-                }
-            }
-        };
+        let effective_ttl = self.compute_effective_ttl(jti, ttl).await?;
 
         let opts = CacheOptions {
             ttl: Some(effective_ttl),
-            tags: vec![format!("session:{}", jti)],
+            tags: vec![session_tag(jti)],
         };
         cache.set(&session_data_key(jti), json, opts).await.map_err(|e| SessionError::Storage(e.to_string()))
     }
 
-    /// Получить произвольные данные сессии.
     pub async fn get_data<T: serde::de::DeserializeOwned>(&self, jti: &str) -> Result<Option<T>, SessionError> {
         let cache = self.cache.as_ref().ok_or(SessionError::Storage("cache not configured".into()))?;
         match cache.get(&session_data_key(jti)).await.map_err(|e| SessionError::Storage(e.to_string()))? {
@@ -123,11 +91,24 @@ impl SessionManager {
         }
     }
 
-    /// Удалить произвольные данные сессии.
     pub async fn remove_data(&self, jti: &str) -> Result<(), SessionError> {
         let cache = self.cache.as_ref().ok_or(SessionError::Storage("cache not configured".into()))?;
         cache.delete(&session_data_key(jti)).await.map_err(|e| SessionError::Storage(e.to_string()))?;
         Ok(())
+    }
+
+    // Вычисление эффективного TTL
+    async fn compute_effective_ttl(&self, jti: &str, ttl: Option<Duration>) -> Result<Duration, SessionError> {
+        if let Some(t) = ttl {
+            return Ok(t);
+        }
+        let token_info = self.store.get_refresh_token(jti).await?.ok_or(SessionError::NotFound)?;
+        let now = chrono::Utc::now();
+        let remaining = token_info.expires_at - now;
+        if remaining.num_seconds() <= 0 {
+            return Err(SessionError::Expired);
+        }
+        Ok(Duration::from_secs(remaining.num_seconds() as u64))
     }
 }
 
@@ -141,4 +122,8 @@ impl Drop for SessionManager {
 
 fn session_data_key(jti: &str) -> String {
     format!("session_data:{}", jti)
+}
+
+fn session_tag(jti: &str) -> String {
+    format!("session:{}", jti)
 }

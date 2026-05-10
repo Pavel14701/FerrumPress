@@ -1,16 +1,22 @@
 use async_trait::async_trait;
-use lapin::{options::*, types::FieldTable, BasicProperties, Channel, Connection, ConnectionProperties, Consumer};
+use lapin::{
+    options::*, types::FieldTable, BasicProperties, Channel,
+    Connection, ConnectionProperties, Consumer,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
+use futures::StreamExt;                     // для .next() на Consumer
 use ferrumpress_core::error::QueueError;
 use crate::{DeliverySemantics, Task, TaskQueue};
 
 pub struct RabbitMqQueue {
     channel: Channel,
     consumer: Arc<Mutex<Consumer>>,
-    tag_to_id: Arc<Mutex<HashMap<u64, String>>>,
+    // task_id -> delivery_tag
+    id_to_tag: Arc<Mutex<HashMap<String, u64>>>,
+    queue_name: String,
     semantics: DeliverySemantics,
 }
 
@@ -30,12 +36,22 @@ impl RabbitMqQueue {
         let consumer = match semantics {
             DeliverySemantics::AtMostOnce => {
                 channel
-                    .basic_consume(queue_name, "ferrumpress_media", BasicConsumeOptions { no_ack: true, ..Default::default() }, FieldTable::default())
+                    .basic_consume(
+                        queue_name,
+                        "ferrumpress_media",
+                        BasicConsumeOptions { no_ack: true, ..Default::default() },
+                        FieldTable::default(),
+                    )
                     .await
             }
             _ => {
                 channel
-                    .basic_consume(queue_name, "ferrumpress_media", BasicConsumeOptions::default(), FieldTable::default())
+                    .basic_consume(
+                        queue_name,
+                        "ferrumpress_media",
+                        BasicConsumeOptions::default(),
+                        FieldTable::default(),
+                    )
                     .await
             }
         }
@@ -44,7 +60,8 @@ impl RabbitMqQueue {
         Ok(Self {
             channel,
             consumer: Arc::new(Mutex::new(consumer)),
-            tag_to_id: Arc::new(Mutex::new(HashMap::new())),
+            id_to_tag: Arc::new(Mutex::new(HashMap::new())),
+            queue_name: queue_name.to_string(),
             semantics,
         })
     }
@@ -57,8 +74,8 @@ impl TaskQueue for RabbitMqQueue {
             .map_err(|e| QueueError::Serialization(e.to_string()))?;
         self.channel
             .basic_publish(
-                "",    // exchange (по умолчанию)
-                "",    // routing key (по умолчанию)
+                "",                       // обменник по умолчанию
+                &self.queue_name,         // routing key = имя очереди
                 BasicPublishOptions::default(),
                 &payload,
                 BasicProperties::default(),
@@ -82,16 +99,18 @@ impl TaskQueue for RabbitMqQueue {
             .map_err(|e| QueueError::Serialization(e.to_string()))?;
 
         if self.semantics != DeliverySemantics::AtMostOnce {
-            let mut map = self.tag_to_id.lock().await;
-            map.insert(delivery.delivery_tag, task.id.clone());
+            let mut map = self.id_to_tag.lock().await;
+            map.insert(task.id.clone(), delivery.delivery_tag);
         }
 
         Ok(Some(task))
     }
 
     async fn ack(&self, task_id: &str) -> Result<(), QueueError> {
-        if self.semantics == DeliverySemantics::AtMostOnce { return Ok(()); }
-        let mut map = self.tag_to_id.lock().await;
+        if self.semantics == DeliverySemantics::AtMostOnce {
+            return Ok(());
+        }
+        let mut map = self.id_to_tag.lock().await;
         if let Some(tag) = map.remove(task_id) {
             self.channel
                 .basic_ack(tag, BasicAckOptions::default())
@@ -102,8 +121,10 @@ impl TaskQueue for RabbitMqQueue {
     }
 
     async fn nack(&self, task_id: &str) -> Result<(), QueueError> {
-        if self.semantics == DeliverySemantics::AtMostOnce { return Ok(()); }
-        let mut map = self.tag_to_id.lock().await;
+        if self.semantics == DeliverySemantics::AtMostOnce {
+            return Ok(());
+        }
+        let mut map = self.id_to_tag.lock().await;
         if let Some(tag) = map.remove(task_id) {
             self.channel
                 .basic_nack(tag, false, true, BasicNackOptions::default())

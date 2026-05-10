@@ -4,12 +4,13 @@ use async_trait::async_trait;
 use sqlx::{AnyPool, Row};
 use ferrumpress_core::traits::{
     TaskQueue, IdempotencyStore, TaskHandler, Task,
-    StorageBackend, ImageVariant, ProcessMediaTask, ImageProcessor
+    StorageBackend, ImageVariant, ProcessMediaTask, ImageProcessor,
 };
 use ferrumpress_core::error::QueueError;
 use std::collections::HashMap;
+use crate::ProcessedVariant;
 
-// ----- Вспомогательные функции для ack/nack -----
+// ----- Вспомогательные функции -----
 async fn ack_task(queue: &dyn TaskQueue, task_id: &str) {
     let _ = queue.ack(task_id).await;
 }
@@ -18,7 +19,6 @@ async fn nack_task(queue: &dyn TaskQueue, task_id: &str) {
     let _ = queue.nack(task_id).await;
 }
 
-// ----- Структура с метаданными из БД -----
 struct MediaRow {
     id: uuid::Uuid,
     storage_strategy: String,
@@ -26,7 +26,6 @@ struct MediaRow {
     mime_type: String,
 }
 
-/// Загрузка строки media по ID. Если нет – возвращает None.
 async fn fetch_media_row(pool: &AnyPool, media_id: uuid::Uuid) -> Option<MediaRow> {
     let row = sqlx::query::<sqlx::Any>("SELECT * FROM media WHERE id = $1")
         .bind(media_id.to_string())
@@ -46,14 +45,12 @@ async fn fetch_media_row(pool: &AnyPool, media_id: uuid::Uuid) -> Option<MediaRo
     })
 }
 
-/// Загрузить оригинальный файл из хранилища. В случае ошибки обновляет статус на "error" и возвращает None.
 async fn fetch_original_data(
     backends: &HashMap<String, Arc<dyn StorageBackend>>,
     pool: &AnyPool,
     media: &MediaRow,
 ) -> Option<Vec<u8>> {
     let backend = backends.get(&media.storage_strategy)?;
-
     match backend.get(&media.storage_key).await {
         Ok(data) => Some(data),
         Err(_) => {
@@ -67,7 +64,6 @@ async fn fetch_original_data(
     }
 }
 
-/// Обработка изображения: конвертация, сохранение вариантов, обновление БД.
 async fn process_and_update_media(
     processor: &dyn ImageProcessor,
     backend: &dyn StorageBackend,
@@ -75,14 +71,13 @@ async fn process_and_update_media(
     media: &MediaRow,
     original_data: Vec<u8>,
 ) -> Result<(), ()> {
-    let variants = processor.process_image(original_data.clone(), &media.mime_type).await.map_err(|_| ())?;
+    let variants = processor.process_image(original_data, &media.mime_type).await.map_err(|_| ())?;
     let mut variant_records = Vec::new();
 
-    for mut v in variants {
-        let variant_key = format!("{}/variant_{}", media.id, v.format);
-        if backend.put(&variant_key, original_data.clone(), &media.mime_type).await.is_ok() {
-            v.key = variant_key;
-            variant_records.push(v);
+    for v in variants {
+        let variant_key = format!("{}/variant_{}", media.id, v.meta.format);
+        if backend.put(&variant_key, v.data, &format!("image/{}", v.meta.format)).await.is_ok() {
+            variant_records.push(v.meta);
         }
     }
 
@@ -101,7 +96,7 @@ async fn process_and_update_media(
     Ok(())
 }
 
-// ----- Основной обработчик задачи -----
+// ----- Основной обработчик -----
 pub struct MediaTaskWorker {
     pool: AnyPool,
     backends: HashMap<String, Arc<dyn StorageBackend>>,
@@ -120,43 +115,34 @@ impl MediaTaskWorker {
 
 #[async_trait]
 impl TaskHandler for MediaTaskWorker {
-    fn handle(&self, task: &Task) -> Pin<Box<dyn Future<Output = Result<(), QueueError>> + Send + '_>> {
-        let pool = self.pool.clone();
-        let backends = self.backends.clone();
-        let processor = self.processor.clone();
-        let task = task.clone();
+    async fn handle(&self, task: &Task) -> Result<(), QueueError> {
+        let payload: ProcessMediaTask = serde_json::from_slice(&task.payload)
+            .map_err(|e| QueueError::Serialization(e.to_string()))?;
+        let media_id = payload.media_id;
 
-        Box::pin(async move {
-            let payload: ProcessMediaTask = serde_json::from_slice(&task.payload)
-                .map_err(|e| QueueError::Serialization(e.to_string()))?;
-            let media_id = payload.media_id;
+        let media = fetch_media_row(&self.pool, media_id).await
+            .ok_or_else(|| QueueError::Internal("media not found".into()))?;
 
-            // 1. Получить метаданные
-            let media = fetch_media_row(&pool, media_id).await
-                .ok_or_else(|| QueueError::Internal("media not found".into()))?;
+        let backend = self.backends.get(&media.storage_strategy)
+            .ok_or_else(|| QueueError::Internal("unknown storage strategy".into()))?;
 
-            // 2. Получить бэкенд
-            let backend = backends.get(&media.storage_strategy)
-                .ok_or_else(|| QueueError::Internal("unknown storage strategy".into()))?;
+        let original = fetch_original_data(&self.backends, &self.pool, &media).await
+            .ok_or_else(|| QueueError::Internal("failed to fetch original data".into()))?;
 
-            // 3. Получить оригинальные данные
-            let original = fetch_original_data(&backends, &pool, &media).await
-                .ok_or_else(|| QueueError::Internal("failed to fetch original data".into()))?;
+        process_and_update_media(
+            self.processor.as_ref(),
+            backend.as_ref(),
+            &self.pool,
+            &media,
+            original,
+        )
+        .await
+        .map_err(|_| QueueError::Internal("image processing failed".into()))?;
 
-            // 4. Обработать и обновить
-            process_and_update_media(
-                self.processor.as_ref(),
-                (*backend).as_ref(),
-                &pool,
-                &media,
-                original,
-            ).await.map_err(|_| QueueError::Internal("image processing failed".into()))?;
-
-            Ok(())
-        })
+        Ok(())
     }
 
-    fn is_idempotent(&self) -> bool { false } // идемпотентность управляется снаружи
+    fn is_idempotent(&self) -> bool { false }
 }
 
 // ----- Основной цикл -----
@@ -177,11 +163,10 @@ pub async fn run_media_worker(
                     continue;
                 }
 
-                // Идемпотентность (для Redis/RabbitMQ, для Kafka передают None)
+                // Идемпотентность
                 if let Some(ref idem) = idempotency {
                     match idem.try_claim(&task.id, 300).await {
                         Ok(false) => {
-                            // Уже выполняется – подтверждаем и пропускаем
                             ack_task(queue.as_ref(), &task.id).await;
                             continue;
                         }
@@ -189,22 +174,19 @@ pub async fn run_media_worker(
                             nack_task(queue.as_ref(), &task.id).await;
                             continue;
                         }
-                        _ => {} // true – продолжаем
+                        _ => {}
                     }
                 }
 
-                // Выполняем задачу
                 match handler.handle(&task).await {
                     Ok(()) => {
                         ack_task(queue.as_ref(), &task.id).await;
-                        // Освобождаем идемпотентный ключ (если был)
                         if let Some(ref idem) = idempotency {
                             let _ = idem.release(&task.id).await;
                         }
                     }
                     Err(_) => {
                         nack_task(queue.as_ref(), &task.id).await;
-                        // Освобождаем ключ, чтобы задачу можно было повторить
                         if let Some(ref idem) = idempotency {
                             let _ = idem.release(&task.id).await;
                         }
