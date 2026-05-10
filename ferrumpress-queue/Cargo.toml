@@ -4,3 +4,24 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+ferrumpress-core = { path = "../ferrumpress-core" }
+async-trait = "0.1"
+tokio = { version = "1", features = ["time", "sync", "macros"] }
+serde_json = "1"
+chrono = "0.4"
+
+# Бэкенды
+lapin = { version = "4.7.2", optional = true }          # RabbitMQ
+redis = { version = "1.2.1", features = ["tokio-comp"], optional = true } # Redis
+rdkafka = { version = "0.39.0", features = ["tokio"], optional = true }  # Kafka
+
+# Для идемпотентности на основе БД (опционально)
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "any"], optional = true }
+
+[features]
+default = []                                      # нет бэкенда по умолчанию
+rabbitmq = ["lapin"]
+redis_queue = ["redis"]                           # очередь на основе Redis
+kafka = ["rdkafka"]
+idempotency-redis = ["redis"]                     # Redis‑хранилище идемпотентности
+idempotency-db = ["sqlx"]                         # БД‑хранилище идемпотентности

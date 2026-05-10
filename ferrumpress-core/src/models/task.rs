@@ -9,3 +9,10 @@ pub struct Task {
     pub priority: u8,
     pub created_at: DateTime<Utc>,
 }
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DeliverySemantics {
+    AtMostOnce,
+    AtLeastOnce,
+    ExactlyOnce,  // требует идемпотентности + поддержки брокера (транзакции)
+}
