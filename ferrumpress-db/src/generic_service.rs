@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use sqlx::{AnyPool, Row, Column};
 use serde_json::{Value, Map};
 use std::sync::Arc;
-use ferrumpress_core::model::{Model, ModelService, ColumnInfo, ColumnKind};
+use ferrumpress_core::models::{Model, ModelService, ColumnInfo, ColumnKind};
 
 pub struct GenericModelService {
     model: Arc<dyn Model>,

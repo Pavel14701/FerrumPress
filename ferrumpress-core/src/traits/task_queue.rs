@@ -1,17 +1,6 @@
-// traits/task_queue.rs
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use crate::error::QueueError;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Task {
-    pub id: String,
-    pub kind: String,
-    pub payload: Vec<u8>,
-    pub priority: u8,
-    pub created_at: DateTime<Utc>,
-}
+use crate::models::Task;
 
 #[async_trait]
 pub trait TaskQueue: Send + Sync {
@@ -19,4 +8,16 @@ pub trait TaskQueue: Send + Sync {
     async fn pop(&self, timeout_secs: u64) -> Result<Option<Task>, QueueError>;
     async fn ack(&self, task_id: &str) -> Result<(), QueueError>;
     async fn nack(&self, task_id: &str) -> Result<(), QueueError>;
+}
+
+#[async_trait]
+pub trait IdempotencyStore: Send + Sync {
+    async fn try_claim(&self, task_id: &str, ttl_secs: u64) -> Result<bool, QueueError>;
+    async fn release(&self, task_id: &str) -> Result<(), QueueError>;
+}
+
+#[async_trait]
+pub trait TaskHandler: Send + Sync {
+    async fn handle(&self, task: &Task) -> Result<(), QueueError>;
+    fn is_idempotent(&self) -> bool { false }
 }

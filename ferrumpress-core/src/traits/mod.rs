@@ -6,6 +6,9 @@ pub mod object_store;
 pub mod search_engine;
 pub mod raw_query;
 pub mod cache;
+pub mod media;
+pub mod storage;
+pub mod image_processor;
 
 pub use relational_db::RelationalDb;
 pub use session_store::SessionStore;
@@ -15,3 +18,6 @@ pub use object_store::ObjectStore;
 pub use search_engine::SearchEngine;
 pub use raw_query::RawQueryExecutor;
 pub use cache::{CacheProvider, CacheOptions};
+pub use media::MediaService;
+pub use storage::{StorageBackend, ProcessMediaTask, ImageVariant, ProcessedVariant};
+pub use image_processor::ImageProcessor;
