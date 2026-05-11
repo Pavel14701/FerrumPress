@@ -31,7 +31,7 @@ pub enum AuthError {
     InvalidToken,
     #[error("user not found")]
     UserNotFound,
-    #[error("internal error: {0}")]
+    #[error("authentication error: {0}")]
     Internal(String),
 }
 
@@ -39,11 +39,11 @@ pub enum AuthError {
 pub enum QueueError {
     #[error("serialization error: {0}")]
     Serialization(String),
-    #[error("connection error: {0}")]
-    Connection(String),
+    #[error("connection error")]
+    Connection,
     #[error("timeout")]
     Timeout,
-    #[error("unknown error: {0}")]
+    #[error("queue operation failed: {0}")]
     Unknown(String),
 }
 
@@ -53,8 +53,8 @@ pub enum SearchError {
     IndexingFailed(String),
     #[error("search query failed: {0}")]
     QueryFailed(String),
-    #[error("connection error: {0}")]
-    Connection(String),
+    #[error("connection error")]
+    Connection,
 }
 
 // A unified application-level error (optional)
@@ -94,12 +94,11 @@ pub enum QueryError {
 
 #[derive(Error, Debug)]
 pub enum CacheError {
-    #[error("cache backend error: {0}")]
-    Backend(String),
+    #[error("cache backend error")]
+    Backend,
     #[error("serialization error: {0}")]
     Serialization(String),
 }
-
 
 #[derive(Error, Debug)]
 pub enum SchemaError {
@@ -117,7 +116,19 @@ pub enum StorageError {
     UploadFailed(String),
     #[error("download failed: {0}")]
     DownloadFailed(String),
-    #[error("unknown strategy: {0}")]
+    #[error("unsupported strategy: {0}")]
+    UnknownStrategy(String),
+}
+
+#[derive(Error, Debug)]
+pub enum MediaError {
+    #[error("storage error: {0}")]
+    Storage(#[from] StorageError),
+    #[error("database error: {0}")]
+    Database(String),
+    #[error("image processing error: {0}")]
+    Image(String),
+    #[error("unsupported strategy: {0}")]
     UnknownStrategy(String),
 }
 
@@ -125,16 +136,4 @@ impl From<SqlxError> for MediaError {
     fn from(e: SqlxError) -> Self {
         MediaError::Database(e.to_string())
     }
-}
-
-#[derive(Error, Debug)]
-pub enum MediaError {
-    #[error(transparent)]
-    Storage(#[from] StorageError),
-    #[error("database error: {0}")]
-    Database(String),
-    #[error("image processing error: {0}")]
-    Image(String),
-    #[error("unknown strategy: {0}")]
-    UnknownStrategy(String),
 }

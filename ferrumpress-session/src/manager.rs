@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
+use tokio::time::sleep;
 use ferrumpress_core::models::token_pair::RefreshTokenInfo;
 use ferrumpress_core::traits::{SessionStore, CacheProvider, CacheOptions};
 use ferrumpress_core::error::SessionError;
@@ -27,9 +28,16 @@ impl SessionManager {
 
     async fn run_cleanup_loop(store: Arc<dyn SessionStore>, interval: Duration) {
         loop {
-            tokio::time::sleep(interval).await;
-            if let Err(e) = store.cleanup_expired().await {
-                tracing::error!("Session cleanup failed: {}", e);
+            tokio::select! {
+                _ = sleep(interval) => {
+                    if let Err(e) = store.cleanup_expired().await {
+                        tracing::error!("Session cleanup failed: {}", e);
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("Session cleanup shutting down gracefully");
+                    break;
+                }
             }
         }
     }

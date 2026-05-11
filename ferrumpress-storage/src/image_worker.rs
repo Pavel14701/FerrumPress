@@ -3,12 +3,23 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sqlx::{AnyPool, Row};
 use ferrumpress_core::traits::{
-    TaskQueue, IdempotencyStore, TaskHandler, Task,
+    TaskQueue, IdempotencyStore, TaskHandler,
     StorageBackend, ImageVariant, ProcessMediaTask, ImageProcessor,
 };
+use ferrumpress_core::models::Task;
 use ferrumpress_core::error::QueueError;
 use std::collections::HashMap;
-use crate::ProcessedVariant;
+use ferrumpress_core::traits::ProcessedVariant;
+use tokio::time::{sleep, Duration};
+use tokio::sync::mpsc;
+
+// Exponential backoff configuration
+const INITIAL_BACKOFF_SECS: u64 = 2;
+const MAX_BACKOFF_SECS: u64 = 60;
+const MAX_RETRIES: u32 = 5;
+
+// Graceful shutdown channel
+const SHUTDOWN_TOKEN: &str = "shutdown";
 
 // ----- Вспомогательные функции -----
 async fn ack_task(queue: &dyn TaskQueue, task_id: &str) {
@@ -31,7 +42,7 @@ async fn fetch_media_row(pool: &AnyPool, media_id: uuid::Uuid) -> Option<MediaRo
         .bind(media_id.to_string())
         .fetch_optional(pool)
         .await
-        .ok()??;
+        .ok()?;
 
     let id: uuid::Uuid = {
         let s: String = row.try_get("id").unwrap_or_default();
@@ -53,7 +64,8 @@ async fn fetch_original_data(
     let backend = backends.get(&media.storage_strategy)?;
     match backend.get(&media.storage_key).await {
         Ok(data) => Some(data),
-        Err(_) => {
+        Err(e) => {
+            tracing::warn!("Failed to fetch original data: {}", e);
             let _ = sqlx::query::<sqlx::Any>("UPDATE media SET status = $1 WHERE id = $2")
                 .bind("error")
                 .bind(media.id.to_string())
@@ -70,20 +82,31 @@ async fn process_and_update_media(
     pool: &AnyPool,
     media: &MediaRow,
     original_data: Vec<u8>,
-) -> Result<(), ()> {
-    let variants = processor.process_image(original_data, &media.mime_type).await.map_err(|_| ())?;
+) -> Result<(), QueueError> {
+    let variants = processor.process_image(original_data, &media.mime_type).await
+        .map_err(|e| QueueError::Unknown(format!("image processing failed: {}", e)))?;
     let mut variant_records = Vec::new();
 
     for v in variants {
         let variant_key = format!("{}/variant_{}", media.id, v.meta.format);
-        if backend.put(&variant_key, v.data, &format!("image/{}", v.meta.format)).await.is_ok() {
-            variant_records.push(v.meta);
+        let put_result = backend.put(&variant_key, v.data, &format!("image/{}", v.meta.format)).await;
+        if let Err(e) = put_result {
+            tracing::warn!("Failed to put variant {}: {}", variant_key, e);
+            continue;
         }
+        variant_records.push(ImageVariant {
+            format: v.meta.format.clone(),
+            key: variant_key,
+            size: v.meta.size,
+            width: v.meta.width,
+            height: v.meta.height,
+        });
     }
 
-    let variants_json = serde_json::to_string(&variant_records).unwrap_or_default();
+    let variants_json = serde_json::to_string(&variant_records)
+        .map_err(|e| QueueError::Serialization(format!("failed to serialize variants: {}", e)))?;
     let now = chrono::Utc::now().to_rfc3339();
-    let _ = sqlx::query::<sqlx::Any>(
+    sqlx::query::<sqlx::Any>(
         "UPDATE media SET status = $1, variants = $2, updated_at = $3 WHERE id = $4"
     )
     .bind("ready")
@@ -91,7 +114,8 @@ async fn process_and_update_media(
     .bind(now)
     .bind(media.id.to_string())
     .execute(pool)
-    .await;
+    .await
+    .map_err(|e| QueueError::Unknown(format!("DB update failed: {}", e)))?;
 
     Ok(())
 }
@@ -120,14 +144,14 @@ impl TaskHandler for MediaTaskWorker {
             .map_err(|e| QueueError::Serialization(e.to_string()))?;
         let media_id = payload.media_id;
 
-        let media = fetch_media_row(&self.pool, media_id).await
-            .ok_or_else(|| QueueError::Internal("media not found".into()))?;
+        let media = fetch_media_row(&self.pool, media_id)
+            .ok_or_else(|| QueueError::Unknown("media not found".into()))?;
 
         let backend = self.backends.get(&media.storage_strategy)
-            .ok_or_else(|| QueueError::Internal("unknown storage strategy".into()))?;
+            .ok_or_else(|| QueueError::Unknown("unknown storage strategy".into()))?;
 
-        let original = fetch_original_data(&self.backends, &self.pool, &media).await
-            .ok_or_else(|| QueueError::Internal("failed to fetch original data".into()))?;
+        let original = fetch_original_data(&self.backends, &self.pool, &media)
+            .ok_or_else(|| QueueError::Unknown("failed to fetch original data".into()))?;
 
         process_and_update_media(
             self.processor.as_ref(),
@@ -136,8 +160,7 @@ impl TaskHandler for MediaTaskWorker {
             &media,
             original,
         )
-        .await
-        .map_err(|_| QueueError::Internal("image processing failed".into()))?;
+        .await?;
 
         Ok(())
     }
@@ -145,7 +168,7 @@ impl TaskHandler for MediaTaskWorker {
     fn is_idempotent(&self) -> bool { false }
 }
 
-// ----- Основной цикл -----
+// ----- Основной цикл с exponential backoff и graceful shutdown -----
 pub async fn run_media_worker(
     queue: Arc<dyn TaskQueue>,
     pool: AnyPool,
@@ -153,48 +176,71 @@ pub async fn run_media_worker(
     processor: Arc<dyn ImageProcessor>,
     idempotency: Option<Arc<dyn IdempotencyStore>>,
 ) {
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     let handler = Arc::new(MediaTaskWorker::new(pool, backends, processor));
 
-    loop {
-        match queue.pop(5).await {
-            Ok(Some(task)) => {
-                if task.kind != "process_media" {
-                    nack_task(queue.as_ref(), &task.id).await;
-                    continue;
-                }
+    let mut retry_count = 0;
 
-                // Идемпотентность
-                if let Some(ref idem) = idempotency {
-                    match idem.try_claim(&task.id, 300).await {
-                        Ok(false) => {
-                            ack_task(queue.as_ref(), &task.id).await;
-                            continue;
-                        }
-                        Err(_) => {
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                tracing::info!("Media worker shutting down gracefully");
+                break;
+            }
+            result = queue.pop(5).await => {
+                match result {
+                    Ok(Some(task)) => {
+                        retry_count = 0;
+                        if task.kind != "process_media" {
                             nack_task(queue.as_ref(), &task.id).await;
                             continue;
                         }
-                        _ => {}
-                    }
-                }
 
-                match handler.handle(&task).await {
-                    Ok(()) => {
-                        ack_task(queue.as_ref(), &task.id).await;
                         if let Some(ref idem) = idempotency {
-                            let _ = idem.release(&task.id).await;
+                            match idem.try_claim(&task.id, 300).await {
+                                Ok(false) => {
+                                    ack_task(queue.as_ref(), &task.id).await;
+                                    continue;
+                                }
+                                Err(e) => {
+                                    tracing::error!("Idempotency claim failed: {}", e);
+                                    nack_task(queue.as_ref(), &task.id).await;
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        match handler.handle(&task).await {
+                            Ok(()) => {
+                                ack_task(queue.as_ref(), &task.id).await;
+                                if let Some(ref idem) = idempotency {
+                                    let _ = idem.release(&task.id).await;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Task handling failed: {}", e);
+                                nack_task(queue.as_ref(), &task.id).await;
+                                if let Some(ref idem) = idempotency {
+                                    let _ = idem.release(&task.id).await;
+                                }
+                            }
                         }
                     }
-                    Err(_) => {
-                        nack_task(queue.as_ref(), &task.id).await;
-                        if let Some(ref idem) = idempotency {
-                            let _ = idem.release(&task.id).await;
-                        }
+                    Ok(None) => {
+                        // Queue is empty, brief pause before next poll
+                        sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(e) => {
+                        tracing::error!("queue pop error: {}", e);
+                        retry_count += 1;
+                        let backoff = INITIAL_BACKOFF_SECS * 2_u64.pow(retry_count.min(MAX_RETRIES) as u32)
+                            .min(MAX_BACKOFF_SECS);
+                        tracing::warn!("retrying in {}s (attempt {})", backoff, retry_count);
+                        sleep(Duration::from_secs(backoff)).await;
                     }
                 }
             }
-            Ok(None) => {}
-            Err(_) => break,
         }
     }
 }

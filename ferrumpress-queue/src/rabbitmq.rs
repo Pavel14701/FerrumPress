@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
-use futures::StreamExt;                     // для .next() на Consumer
+use futures::StreamExt;
 use ferrumpress_core::error::QueueError;
 use crate::{DeliverySemantics, Task, TaskQueue};
 
@@ -28,10 +28,10 @@ impl RabbitMqQueue {
     ) -> Result<Self, QueueError> {
         let conn = Connection::connect(amqp_url, ConnectionProperties::default())
             .await
-            .map_err(|e| QueueError::Internal(format!("RabbitMQ connection: {}", e)))?;
+            .map_err(|e| QueueError::Unknown(format!("RabbitMQ connection: {}", e)))?;
         let channel = conn.create_channel()
             .await
-            .map_err(|e| QueueError::Internal(format!("create channel: {}", e)))?;
+            .map_err(|e| QueueError::Unknown(format!("create channel: {}", e)))?;
 
         let consumer = match semantics {
             DeliverySemantics::AtMostOnce => {
@@ -55,7 +55,7 @@ impl RabbitMqQueue {
                     .await
             }
         }
-        .map_err(|e| QueueError::Internal(format!("consumer: {}", e)))?;
+        .map_err(|e| QueueError::Unknown(format!("consumer: {}", e)))?;
 
         Ok(Self {
             channel,
@@ -74,14 +74,14 @@ impl TaskQueue for RabbitMqQueue {
             .map_err(|e| QueueError::Serialization(e.to_string()))?;
         self.channel
             .basic_publish(
-                "",                       // обменник по умолчанию
-                &self.queue_name,         // routing key = имя очереди
+                "",                       // default exchange
+                &self.queue_name,         // routing key = queue name
                 BasicPublishOptions::default(),
                 &payload,
                 BasicProperties::default(),
             )
             .await
-            .map_err(|e| QueueError::Internal(format!("publish: {}", e)))?;
+            .map_err(|e| QueueError::Unknown(format!("publish: {}", e)))?;
         Ok(())
     }
 
@@ -91,7 +91,7 @@ impl TaskQueue for RabbitMqQueue {
         let recv = guard.next();
         let delivery = match timeout(Duration::from_secs(timeout_secs), recv).await {
             Ok(Some(Ok(delivery))) => delivery,
-            Ok(Some(Err(e))) => return Err(QueueError::Internal(format!("delivery error: {}", e))),
+            Ok(Some(Err(e))) => return Err(QueueError::Unknown(format!("delivery error: {}", e))),
             Ok(None) | Err(_) => return Ok(None),
         };
 
@@ -115,7 +115,7 @@ impl TaskQueue for RabbitMqQueue {
             self.channel
                 .basic_ack(tag, BasicAckOptions::default())
                 .await
-                .map_err(|e| QueueError::Internal(format!("ack: {}", e)))?;
+                .map_err(|e| QueueError::Unknown(format!("ack: {}", e)))?;
         }
         Ok(())
     }
@@ -129,7 +129,7 @@ impl TaskQueue for RabbitMqQueue {
             self.channel
                 .basic_nack(tag, false, true, BasicNackOptions::default())
                 .await
-                .map_err(|e| QueueError::Internal(format!("nack: {}", e)))?;
+                .map_err(|e| QueueError::Unknown(format!("nack: {}", e)))?;
         }
         Ok(())
     }

@@ -28,3 +28,10 @@ pub struct ImageVariant {
     pub width: u32,
     pub height: u32,
 }
+
+/// Вариант с сырыми данными после обработки
+#[derive(Debug, Clone)]
+pub struct ProcessedVariant {
+    pub meta: ImageVariant,
+    pub data: Vec<u8>,
+}

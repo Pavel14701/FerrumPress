@@ -29,7 +29,7 @@ impl KafkaQueue {
             .set("bootstrap.servers", brokers)
             .set("message.timeout.ms", "5000")
             .create()
-            .map_err(|e| QueueError::Internal(format!("kafka producer: {}", e)))?;
+            .map_err(|e| QueueError::Unknown(format!("kafka producer: {}", e)))?;
 
         let mut consumer_config = ClientConfig::new();
         consumer_config
@@ -45,10 +45,10 @@ impl KafkaQueue {
 
         let consumer: StreamConsumer = consumer_config
             .create()
-            .map_err(|e| QueueError::Internal(format!("kafka consumer: {}", e)))?;
+            .map_err(|e| QueueError::Unknown(format!("kafka consumer: {}", e)))?;
 
         consumer.subscribe(&[topic])
-            .map_err(|e| QueueError::Internal(format!("subscribe: {}", e)))?;
+            .map_err(|e| QueueError::Unknown(format!("subscribe: {}", e)))?;
 
         Ok(Self {
             consumer,
@@ -72,7 +72,7 @@ impl TaskQueue for KafkaQueue {
             )
             .await
             .map(|_| ())
-            .map_err(|(e, _)| QueueError::Internal(format!("kafka send: {}", e)))?;
+            .map_err(|(e, _)| QueueError::Unknown(format!("kafka send: {}", e)))?;
         Ok(())
     }
 
@@ -80,11 +80,11 @@ impl TaskQueue for KafkaQueue {
         let future = self.consumer.recv();
         let msg = match timeout(Duration::from_secs(timeout_secs), future).await {
             Ok(Ok(msg)) => msg,
-            Ok(Err(e)) => return Err(QueueError::Internal(format!("recv: {}", e))),
+            Ok(Err(e)) => return Err(QueueError::Unknown(format!("recv: {}", e))),
             Err(_) => return Ok(None),
         };
 
-        let payload = msg.payload().ok_or(QueueError::Internal("empty payload".into()))?;
+        let payload = msg.payload().ok_or(QueueError::Unknown("empty payload".into()))?;
         let task: Task = serde_json::from_slice(payload)
             .map_err(|e| QueueError::Serialization(e.to_string()))?;
 
@@ -100,9 +100,10 @@ impl TaskQueue for KafkaQueue {
         if self.semantics == DeliverySemantics::AtMostOnce { return Ok(()); }
         let mut pending = self.pending.lock().await;
         if let Some((partition, offset)) = pending.remove(task_id) {
+            // Use commit_offsets which is the correct API
             self.consumer
-                .commit_offsets(&self.topic, &[(partition, offset + 1)], rdkafka::consumer::CommitMode::Async)
-                .map_err(|e| QueueError::Internal(format!("commit: {}", e)))?;
+                .commit_offsets(&[(partition, offset + 1)], rdkafka::consumer::CommitMode::Async)
+                .map_err(|e| QueueError::Unknown(format!("commit: {}", e)))?;
         }
         Ok(())
     }
@@ -110,7 +111,7 @@ impl TaskQueue for KafkaQueue {
     async fn nack(&self, task_id: &str) -> Result<(), QueueError> {
         if self.semantics == DeliverySemantics::AtMostOnce { return Ok(()); }
         let mut pending = self.pending.lock().await;
-        pending.remove(task_id); // не коммитим, сообщение будет перечитано
+        pending.remove(task_id);
         Ok(())
     }
 }

@@ -3,11 +3,7 @@ use ferrumpress_core::error::StorageError;
 use ferrumpress_core::traits::StorageBackend;
 
 pub struct S3Backend {
-    bucket: String,
-    region: String,
-    endpoint: String,
-    access_key: String,
-    secret_key: String,
+    bucket: std::sync::Arc<rust_s3::Bucket>,
 }
 
 impl S3Backend {
@@ -17,41 +13,34 @@ impl S3Backend {
         endpoint: &str,
         access_key: &str,
         secret_key: &str,
-    ) -> Self {
-        Self {
-            bucket: bucket.to_string(),
-            region: region.to_string(),
-            endpoint: endpoint.to_string(),
-            access_key: access_key.to_string(),
-            secret_key: secret_key.to_string(),
-        }
-    }
-
-    fn create_bucket(&self) -> Result<rust_s3::Bucket, StorageError> {
-        rust_s3::Bucket::new(
-            &self.bucket,
+    ) -> Result<Self, StorageError> {
+        let bucket_obj = rust_s3::Bucket::new(
+            bucket,
             rust_s3::Region::Custom {
-                region: self.region.clone(),
-                endpoint: self.endpoint.clone(),
+                region: region.to_string(),
+                endpoint: endpoint.to_string(),
             },
             rust_s3::Credentials::new(
-                Some(&self.access_key),
-                Some(&self.secret_key),
+                Some(access_key),
+                Some(secret_key),
                 None,
                 None,
                 None,
             )
             .map_err(|e| StorageError::UploadFailed(e.to_string()))?,
         )
-        .map_err(|e| StorageError::UploadFailed(e.to_string()))
+        .map_err(|e| StorageError::UploadFailed(e.to_string()))?;
+
+        Ok(Self {
+            bucket: std::sync::Arc::new(bucket_obj),
+        })
     }
 }
 
 #[async_trait]
 impl StorageBackend for S3Backend {
     async fn put(&self, key: &str, data: Vec<u8>, content_type: &str) -> Result<(), StorageError> {
-        let bucket = self.create_bucket()?;
-        let response = bucket
+        let response = self.bucket
             .put_object_with_content_type(key, &data, content_type)
             .await
             .map_err(|e| StorageError::UploadFailed(e.to_string()))?;
@@ -66,8 +55,7 @@ impl StorageBackend for S3Backend {
     }
 
     async fn get(&self, key: &str) -> Result<Vec<u8>, StorageError> {
-        let bucket = self.create_bucket()?;
-        let response = bucket
+        let response = self.bucket
             .get_object(key)
             .await
             .map_err(|e| StorageError::NotFound(e.to_string()))?;
@@ -82,8 +70,7 @@ impl StorageBackend for S3Backend {
     }
 
     async fn delete(&self, key: &str) -> Result<(), StorageError> {
-        let bucket = self.create_bucket()?;
-        let response = bucket
+        let response = self.bucket
             .delete_object(key)
             .await
             .map_err(|e| StorageError::NotFound(e.to_string()))?;
@@ -98,14 +85,16 @@ impl StorageBackend for S3Backend {
     }
 
     fn public_url(&self, key: &str) -> Option<String> {
-        // Для AWS отдаём стандартный формат, иначе общий
-        if self.endpoint.contains("amazonaws.com") {
+        // For AWS return standard format, otherwise generic
+        if self.bucket.region().map(|r| r.contains("amazonaws.com")).unwrap_or(false) {
             Some(format!(
                 "https://{}.s3.{}.amazonaws.com/{}",
-                self.bucket, self.region, key
+                self.bucket.name(),
+                self.bucket.region().unwrap_or("us-east-1"),
+                key
             ))
         } else {
-            Some(format!("{}/{}/{}", self.endpoint, self.bucket, key))
+            Some(format!("{}/{}/{}", self.bucket.endpoint(), self.bucket.name(), key))
         }
     }
 

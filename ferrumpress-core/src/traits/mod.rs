@@ -19,5 +19,5 @@ pub use search_engine::SearchEngine;
 pub use raw_query::RawQueryExecutor;
 pub use cache::{CacheProvider, CacheOptions};
 pub use media::MediaService;
-pub use storage::{StorageBackend, ProcessMediaTask, ImageVariant};
+pub use storage::{StorageBackend, ProcessMediaTask, ImageVariant, ProcessedVariant};
 pub use image_processor::ImageProcessor;

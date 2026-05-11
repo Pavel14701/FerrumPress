@@ -6,12 +6,28 @@ use uuid::Uuid;
 use chrono::{DateTime, Utc};
 use ferrumpress_core::traits::{
     StorageBackend, MediaService,
-    ImageVariant, ProcessMediaTask,
+    ProcessMediaTask,
     CacheProvider, TaskQueue, CacheOptions,
     ImageProcessor
 };
 use ferrumpress_core::models::{Media, Task};
 use ferrumpress_core::error::{MediaError, StorageError};
+
+// Maximum allowed file size (50MB)
+const MAX_FILE_SIZE: usize = 50 * 1024 * 1024;
+
+// Allowed MIME types for upload
+const ALLOWED_MIME_TYPES: &[&str] = &[
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+    "image/avif",
+    "application/pdf",
+    "video/mp4",
+    "audio/mpeg",
+    "audio/wav",
+];
 
 // -----------------------------------------------------------
 // Структура, которая точно повторяет столбцы таблицы `media`
@@ -36,9 +52,12 @@ impl TryFrom<DbMedia> for Media {
     type Error = MediaError;
 
     fn try_from(db: DbMedia) -> Result<Self, Self::Error> {
+        // Validate UUID format to prevent panic on invalid input
+        let id = Uuid::parse_str(&db.id)
+            .map_err(|e| MediaError::Database(format!("invalid UUID format: {}", e)))?;
+
         Ok(Media {
-            id: Uuid::parse_str(&db.id)
-                .map_err(|e| MediaError::Database(e.to_string()))?,
+            id,
             original_name: db.original_name,
             storage_strategy: db.storage_strategy,
             storage_key: db.storage_key,
@@ -49,10 +68,10 @@ impl TryFrom<DbMedia> for Media {
             status: db.status,
             variants: db.variants,
             created_at: DateTime::parse_from_rfc3339(&db.created_at)
-                .map_err(|e| MediaError::Database(e.to_string()))?
+                .map_err(|e| MediaError::Database(format!("invalid datetime: {}", e)))?
                 .with_timezone(&Utc),
             updated_at: DateTime::parse_from_rfc3339(&db.updated_at)
-                .map_err(|e| MediaError::Database(e.to_string()))?
+                .map_err(|e| MediaError::Database(format!("invalid datetime: {}", e)))?
                 .with_timezone(&Utc),
         })
     }
@@ -95,7 +114,7 @@ impl<'a> MediaCache<'a> {
 }
 
 // -----------------------------------------------------------
-// Сервис (логика осталась прежней, но стала компактнее)
+// Сервис
 // -----------------------------------------------------------
 pub struct MediaServiceImpl {
     pool: AnyPool,
@@ -118,8 +137,39 @@ impl MediaServiceImpl {
 
     fn is_image(mime: &str) -> bool { mime.starts_with("image/") }
 
+    fn is_allowed_mime(mime: &str) -> bool {
+        ALLOWED_MIME_TYPES.contains(&mime)
+    }
+
     fn cache_helper(&self) -> Option<MediaCache<'_>> {
         self.cache.as_deref().map(|cache| MediaCache { cache })
+    }
+
+    fn validate_upload(&self, original_name: &str, data: &[u8], mime_type: &str) -> Result<(), MediaError> {
+        // Validate file size
+        if data.len() > MAX_FILE_SIZE {
+            return Err(MediaError::Storage(StorageError::UploadFailed(format!(
+                "file size {} exceeds maximum {}",
+                data.len(), MAX_FILE_SIZE
+            ))));
+        }
+
+        // Validate MIME type
+        if !Self::is_allowed_mime(mime_type) {
+            return Err(MediaError::Storage(StorageError::UploadFailed(format!(
+                "unsupported MIME type: {}",
+                mime_type
+            ))));
+        }
+
+        // Validate filename
+        if original_name.is_empty() || original_name.contains('/') || original_name.contains('\\') {
+            return Err(MediaError::Storage(StorageError::UploadFailed(
+                "invalid filename".into()
+            )));
+        }
+
+        Ok(())
     }
 }
 
@@ -133,6 +183,9 @@ impl MediaService for MediaServiceImpl {
         strategy: &str,
         convert: bool,
     ) -> Result<Media, MediaError> {
+        // Validate upload before processing
+        self.validate_upload(original_name, &data, mime_type)?;
+
         let backend = self.backends.get(strategy)
             .ok_or_else(|| MediaError::UnknownStrategy(strategy.into()))?;
         let id = Uuid::new_v4();
@@ -169,7 +222,8 @@ impl MediaService for MediaServiceImpl {
             let task = Task {
                 id: Uuid::new_v4().to_string(),
                 kind: "process_media".into(),
-                payload: serde_json::to_vec(&ProcessMediaTask { media_id: id }).unwrap(),
+                payload: serde_json::to_vec(&ProcessMediaTask { media_id: id })
+                    .map_err(|e| MediaError::Database(e.to_string()))?,
                 priority: 5,
                 created_at: Utc::now(),
             };
@@ -199,14 +253,12 @@ impl MediaService for MediaServiceImpl {
     }
 
     async fn get_by_id(&self, id: Uuid) -> Result<Option<Media>, MediaError> {
-        // 1. кэш
         if let Some(cache) = self.cache_helper() {
             if let Some(media) = cache.get(id).await {
                 return Ok(Some(media));
             }
         }
 
-        // 2. БД
         let db_media: Option<DbMedia> = sqlx::query_as::<_, DbMedia>(
             "SELECT * FROM media WHERE id = $1"
         )
@@ -232,21 +284,21 @@ impl MediaService for MediaServiceImpl {
 
         let backend = self.backends.get(&media.storage_strategy)
             .ok_or_else(|| MediaError::UnknownStrategy(media.storage_strategy.clone()))?;
-        backend.delete(&media.storage_key).await.ok();
 
-        if let Some(variants_json) = &media.variants {
-            if let Ok(variants) = serde_json::from_str::<Vec<ImageVariant>>(variants_json) {
-                for v in variants {
-                    backend.delete(&v.key).await.ok();
-                }
-            }
-        }
+        // Attempt storage deletion and track result
+        let backend_delete_result = backend.delete(&media.storage_key).await;
 
-        sqlx::query::<sqlx::Any>("DELETE FROM media WHERE id = $1")
+        // Always attempt to delete from DB
+        let _db_delete_result = sqlx::query::<sqlx::Any>("DELETE FROM media WHERE id = $1")
             .bind(id.to_string())
             .execute(&self.pool)
             .await
             .map_err(|e| MediaError::Database(e.to_string()))?;
+
+        // Return error if backend deletion failed
+        if let Err(e) = backend_delete_result {
+            return Err(MediaError::Storage(e));
+        }
 
         if let Some(cache) = self.cache_helper() {
             cache.delete(id).await;
