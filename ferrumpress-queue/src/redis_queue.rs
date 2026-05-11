@@ -6,7 +6,7 @@ use ferrumpress_core::error::QueueError;
 use crate::{DeliverySemantics, Task, TaskQueue};
 
 pub struct RedisQueue {
-    conn: ConnectionManager,
+    conn: Arc<Mutex<ConnectionManager>>,
     source_queue: String,
     processing_queue: String,
     semantics: DeliverySemantics,
@@ -24,7 +24,7 @@ impl RedisQueue {
         let conn = client.get_tokio_connection_manager()
             .map_err(|e| QueueError::Connection)?;
         Ok(Self {
-            conn,
+            conn: Arc::new(Mutex::new(conn)),
             source_queue: source.to_string(),
             processing_queue: processing.to_string(),
             semantics,
@@ -37,7 +37,7 @@ impl TaskQueue for RedisQueue {
     async fn push(&self, task: Task) -> Result<(), QueueError> {
         let payload = serde_json::to_string(&task)
             .map_err(|e| QueueError::Serialization(e.to_string()))?;
-        let mut conn = self.conn.clone();
+        let mut conn = self.conn.lock().await;
         let _: () = conn.lpush(&self.source_queue, payload)
             .await
             .map_err(|e| QueueError::Unknown(e.to_string()))?;
@@ -45,7 +45,7 @@ impl TaskQueue for RedisQueue {
     }
 
     async fn pop(&self, timeout_secs: u64) -> Result<Option<Task>, QueueError> {
-        let mut conn = self.conn.clone();
+        let mut conn = self.conn.lock().await;
 
         let result: Option<String> = if self.semantics == DeliverySemantics::AtMostOnce {
             redis::cmd("RPOP")
@@ -77,9 +77,20 @@ impl TaskQueue for RedisQueue {
         if self.semantics == DeliverySemantics::AtMostOnce {
             return Ok(());
         }
-        let mut conn = self.conn.clone();
-        // Remove from processing queue by task_id (using LREM)
-        let _: () = conn.lrem(&self.processing_queue, 0, task_id)
+        let mut conn = self.conn.lock().await;
+        // Remove from processing queue by the serialized payload
+        // We need to search by task_id which is in the JSON payload
+        // Build the task object to get the exact payload
+        let task = Task {
+            id: task_id.to_string(),
+            kind: String::new(),
+            payload: Vec::new(),
+            priority: 0,
+            created_at: chrono::Utc::now(),
+        };
+        let payload = serde_json::to_string(&task)
+            .map_err(|e| QueueError::Serialization(e.to_string()))?;
+        let _: () = conn.lrem(&self.processing_queue, 0, payload)
             .await
             .map_err(|e| QueueError::Unknown(e.to_string()))?;
         Ok(())
@@ -89,9 +100,21 @@ impl TaskQueue for RedisQueue {
         if self.semantics == DeliverySemantics::AtMostOnce {
             return Ok(());
         }
-        let mut conn = self.conn.clone();
-        // Remove from processing queue and push back to source
-        let _: () = conn.lrem(&self.processing_queue, 0, task_id)
+        let mut conn = self.conn.lock().await;
+        let task = Task {
+            id: task_id.to_string(),
+            kind: String::new(),
+            payload: Vec::new(),
+            priority: 0,
+            created_at: chrono::Utc::now(),
+        };
+        let payload = serde_json::to_string(&task)
+            .map_err(|e| QueueError::Serialization(e.to_string()))?;
+        let _: () = conn.lrem(&self.processing_queue, 0, payload)
+            .await
+            .map_err(|e| QueueError::Unknown(e.to_string()))?;
+        // Also push back to source queue
+        let _: () = conn.lpush(&self.source_queue, payload)
             .await
             .map_err(|e| QueueError::Unknown(e.to_string()))?;
         Ok(())

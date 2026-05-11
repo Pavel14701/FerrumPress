@@ -1,9 +1,11 @@
 use async_trait::async_trait;
+use rust_s3::Bucket;
+use rust_s3::Credentials;
 use ferrumpress_core::error::StorageError;
 use ferrumpress_core::traits::StorageBackend;
 
 pub struct S3Backend {
-    bucket: std::sync::Arc<rust_s3::Bucket>,
+    bucket: std::sync::Arc<Bucket>,
 }
 
 impl S3Backend {
@@ -14,20 +16,22 @@ impl S3Backend {
         access_key: &str,
         secret_key: &str,
     ) -> Result<Self, StorageError> {
-        let bucket_obj = rust_s3::Bucket::new(
+        let credentials = Credentials::new(
+            Some(access_key),
+            Some(secret_key),
+            None,
+            None,
+            None,
+        )
+        .map_err(|e| StorageError::UploadFailed(e.to_string()))?;
+
+        let bucket_obj = Bucket::new(
             bucket,
             rust_s3::Region::Custom {
                 region: region.to_string(),
                 endpoint: endpoint.to_string(),
             },
-            rust_s3::Credentials::new(
-                Some(access_key),
-                Some(secret_key),
-                None,
-                None,
-                None,
-            )
-            .map_err(|e| StorageError::UploadFailed(e.to_string()))?,
+            credentials,
         )
         .map_err(|e| StorageError::UploadFailed(e.to_string()))?;
 

@@ -64,10 +64,23 @@ impl SessionStore for DatabaseSessionStore {
         .map_err(|e| SessionError::Storage(e.to_string()))?;
 
         Ok(row.map(|(jti, user_id, expires_at, user_agent, ip_address)| {
-            let parsed_user_id = Uuid::from_slice(&user_id).unwrap_or_else(|_| Uuid::nil());
+            let parsed_user_id = Uuid::from_slice(&user_id)
+                .map_err(|e| {
+                    SessionError::Storage(format!(
+                        "failed to parse user_id as UUID for refresh token {jti}: {e}"
+                    ))
+                })
+                .expect("user_id must be valid UUID");
+
             let parsed_expires_at = chrono::DateTime::parse_from_rfc3339(&expires_at)
-                .unwrap_or_else(|_| chrono::DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z").unwrap())
-                .with_timezone(&chrono::Utc);
+                .map_err(|e| {
+                    SessionError::Storage(format!(
+                        "failed to parse expires_at as RFC3339 timestamp for refresh token {jti}: {e}"
+                    ))
+                })
+                .expect("expires_at must be valid RFC3339")
+                .with_timezone(&Utc);
+
             RefreshTokenInfo {
                 jti,
                 user_id: parsed_user_id,

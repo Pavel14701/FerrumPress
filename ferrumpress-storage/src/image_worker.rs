@@ -11,24 +11,11 @@ use ferrumpress_core::error::QueueError;
 use std::collections::HashMap;
 use ferrumpress_core::traits::ProcessedVariant;
 use tokio::time::{sleep, Duration};
-use tokio::sync::mpsc;
 
 // Exponential backoff configuration
 const INITIAL_BACKOFF_SECS: u64 = 2;
 const MAX_BACKOFF_SECS: u64 = 60;
 const MAX_RETRIES: u32 = 5;
-
-// Graceful shutdown channel
-const SHUTDOWN_TOKEN: &str = "shutdown";
-
-// ----- Вспомогательные функции -----
-async fn ack_task(queue: &dyn TaskQueue, task_id: &str) {
-    let _ = queue.ack(task_id).await;
-}
-
-async fn nack_task(queue: &dyn TaskQueue, task_id: &str) {
-    let _ = queue.nack(task_id).await;
-}
 
 struct MediaRow {
     id: uuid::Uuid,
@@ -91,7 +78,7 @@ async fn process_and_update_media(
         let variant_key = format!("{}/variant_{}", media.id, v.meta.format);
         let put_result = backend.put(&variant_key, v.data, &format!("image/{}", v.meta.format)).await;
         if let Err(e) = put_result {
-            tracing::warn!("Failed to put variant {}: {}", variant_key, e);
+            tracing::error!("Failed to put variant {}: {}", variant_key, e);
             continue;
         }
         variant_records.push(ImageVariant {
@@ -168,7 +155,7 @@ impl TaskHandler for MediaTaskWorker {
     fn is_idempotent(&self) -> bool { false }
 }
 
-// ----- Основной цикл с exponential backoff и graceful shutdown -----
+// ----- Основной цикл с exponential backoff -----
 pub async fn run_media_worker(
     queue: Arc<dyn TaskQueue>,
     pool: AnyPool,
@@ -176,70 +163,62 @@ pub async fn run_media_worker(
     processor: Arc<dyn ImageProcessor>,
     idempotency: Option<Arc<dyn IdempotencyStore>>,
 ) {
-    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     let handler = Arc::new(MediaTaskWorker::new(pool, backends, processor));
 
     let mut retry_count = 0;
 
     loop {
-        tokio::select! {
-            _ = shutdown_rx.recv() => {
-                tracing::info!("Media worker shutting down gracefully");
-                break;
-            }
-            result = queue.pop(5).await => {
-                match result {
-                    Ok(Some(task)) => {
-                        retry_count = 0;
-                        if task.kind != "process_media" {
-                            nack_task(queue.as_ref(), &task.id).await;
+        let result = queue.pop(5).await;
+        match result {
+            Ok(Some(task)) => {
+                retry_count = 0;
+                if task.kind != "process_media" {
+                    let _ = queue.nack(&task.id).await;
+                    continue;
+                }
+
+                if let Some(ref idem) = idempotency {
+                    match idem.try_claim(&task.id, 300).await {
+                        Ok(false) => {
+                            let _ = queue.ack(&task.id).await;
                             continue;
                         }
-
-                        if let Some(ref idem) = idempotency {
-                            match idem.try_claim(&task.id, 300).await {
-                                Ok(false) => {
-                                    ack_task(queue.as_ref(), &task.id).await;
-                                    continue;
-                                }
-                                Err(e) => {
-                                    tracing::error!("Idempotency claim failed: {}", e);
-                                    nack_task(queue.as_ref(), &task.id).await;
-                                    continue;
-                                }
-                                _ => {}
-                            }
+                        Err(e) => {
+                            tracing::error!("Idempotency claim failed: {}", e);
+                            let _ = queue.nack(&task.id).await;
+                            continue;
                         }
-
-                        match handler.handle(&task).await {
-                            Ok(()) => {
-                                ack_task(queue.as_ref(), &task.id).await;
-                                if let Some(ref idem) = idempotency {
-                                    let _ = idem.release(&task.id).await;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("Task handling failed: {}", e);
-                                nack_task(queue.as_ref(), &task.id).await;
-                                if let Some(ref idem) = idempotency {
-                                    let _ = idem.release(&task.id).await;
-                                }
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        // Queue is empty, brief pause before next poll
-                        sleep(Duration::from_millis(100)).await;
-                    }
-                    Err(e) => {
-                        tracing::error!("queue pop error: {}", e);
-                        retry_count += 1;
-                        let backoff = INITIAL_BACKOFF_SECS * 2_u64.pow(retry_count.min(MAX_RETRIES) as u32)
-                            .min(MAX_BACKOFF_SECS);
-                        tracing::warn!("retrying in {}s (attempt {})", backoff, retry_count);
-                        sleep(Duration::from_secs(backoff)).await;
+                        _ => {}
                     }
                 }
+
+                match handler.handle(&task).await {
+                    Ok(()) => {
+                        let _ = queue.ack(&task.id).await;
+                        if let Some(ref idem) = idempotency {
+                            let _ = idem.release(&task.id).await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Task handling failed: {}", e);
+                        let _ = queue.nack(&task.id).await;
+                        if let Some(ref idem) = idempotency {
+                            let _ = idem.release(&task.id).await;
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                // Queue is empty, brief pause before next poll
+                sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => {
+                tracing::error!("queue pop error: {}", e);
+                retry_count += 1;
+                let backoff = INITIAL_BACKOFF_SECS * 2_u64.pow(retry_count.min(MAX_RETRIES) as u32)
+                    .min(MAX_BACKOFF_SECS);
+                tracing::warn!("retrying in {}s (attempt {})", backoff, retry_count);
+                sleep(Duration::from_secs(backoff)).await;
             }
         }
     }

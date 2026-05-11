@@ -3,6 +3,7 @@ pub mod database;
 pub mod redis_store;
 pub mod manager;
 
+#[cfg(feature = "database")]
 pub use database::DatabaseSessionStore;
 #[cfg(feature = "redis-backend")]
 pub use redis_store::RedisSessionStore;

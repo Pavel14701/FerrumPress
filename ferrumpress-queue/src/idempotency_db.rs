@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use sqlx::AnyPool;
-use chrono::{Utc, Duration};
+use chrono::{Duration, Utc};
 use ferrumpress_core::traits::IdempotencyStore;
 use ferrumpress_core::error::QueueError;
 

@@ -15,7 +15,8 @@ impl Migration for CreateTaskLocksTable {
 
     async fn up(&self, pool: &AnyPool) -> Result<(), sqlx::Error> {
         // Cross-database compatible approach
-        // Uses IF NOT EXISTS for SQLite/MySQL and standard INSERT for PostgreSQL
+        // SQLite and MySQL use IF NOT EXISTS / INSERT OR IGNORE
+        // PostgreSQL uses ON CONFLICT DO NOTHING
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS task_locks (
                 task_id TEXT PRIMARY KEY,
@@ -33,4 +34,16 @@ impl Migration for CreateTaskLocksTable {
             .await?;
         Ok(())
     }
+}
+
+/// Cleanup expired task locks
+/// Should be called periodically (e.g., via a scheduled task)
+pub async fn cleanup_expired_task_locks(pool: &AnyPool) -> Result<u64, sqlx::Error> {
+    // Cross-database compatible: SQLite and MySQL support DELETE with subquery
+    let result = sqlx::query::<sqlx::Any>(
+        "DELETE FROM task_locks WHERE expires_at < datetime('now')"
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
